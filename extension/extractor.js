@@ -51,6 +51,9 @@
     return resp;
   };
 
+  async function readInitialState() {
+    if (window.__PLAYURL_HYDRATE_DATA__) return window.__PLAYURL_HYDRATE_DATA__;
+    if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.videoData) return window.__INITIAL_STATE__;
     try {
       const r = await origFetch(window.location.href, { credentials: 'include', cache: 'no-store' });
       const html = await r.text();
@@ -94,6 +97,7 @@
       }
     }
     return { aid, bvid, cid, p, title };
+  }
 
   // 从播放器 active 画质菜单读取当前清晰度，读不到再用 localStorage 默认值。
   function readQuality() {
@@ -114,6 +118,7 @@
       } catch (_) { /* 忽略 */ }
     }
     return qn || 120;
+  }
 
   // 主动请求 playurl，复用页面 Cookie（credentials: include）。
   // 用原始 fetch，避免被本脚本的 hook 再次捕获。
