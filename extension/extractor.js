@@ -51,11 +51,95 @@
     return resp;
   };
 
-  // ---- 3. 页面 state 读取（部分页面把 playurl 注入全局变量）----
+    try {
+      const r = await origFetch(window.location.href, { credentials: 'include', cache: 'no-store' });
+      const html = await r.text();
+      let m = html.match(/<script>window\.__INITIAL_STATE__=(.+?)<\/script>/);
+      if (m && m[1]) {
+        // 页面在 JSON 尾部拼了一段自清理脚本，必须先剥离再解析（注意 removeChild(s); 后有个分号）。
+        const CLEANUP = ";(function(){var s;(s=document.currentScript||document.scripts[document.scripts.length-1]).parentNode.removeChild(s);}());";
+        const txt = m[1].replace(CLEANUP, '');
+        try { return JSON.parse(txt); } catch (_) { /* 继续试下一个入口 */ }
+      }
+      m = html.match(/<script id="__NEXT_DATA__" type="application\/json">(.+?)<\/script>/);
+      if (m && m[1]) {
+        const q = JSON.parse(m[1]);
+        const st = q && q.props && q.props.dehydratedState
+          && q.props.dehydratedState.queries && q.props.dehydratedState.queries[0]
+          && q.props.dehydratedState.queries[0].state;
+        if (st && st.status === 'success') return st;
+      }
+    } catch (_) { /* 忽略，走兜底 */ }
+    return window.__INITIAL_STATE__ || null;
+  }
+
+  // 从 __INITIAL_STATE__ 拿真实 aid/bvid/cid；分集按 ?p=N 从 pages 里取。
+  function readMetaFromState(state) {
+    const d = (state && state.data) || {};
+    const vd = d.videoData || (state && state.videoData) || {};
+    let aid = Number(vd.aid) || 0;
+    let bvid = vd.bvid || (location.pathname.match(/(BV[0-9A-Za-z]{10})/) || [])[1] || '';
+    let cid = Number(vd.cid) || 0;
+    let title = vd.title || '';
+    let p = 1;
+    const pm = location.href.match(/[?&]p=(\d+)/);
+    if (pm) p = parseInt(pm[1], 10);
+    const pages = Array.isArray(vd.pages) ? vd.pages : [];
+    if (pages.length > 1) {
+      const sp = pages.find((x) => Number(x.page) === p) || pages[0];
+      if (sp) {
+        p = Number(sp.page) || p;
+        cid = Number(sp.cid) || cid;
+        title = `${title}_P${sp.page}_${sp.part || ''}`.replace(/_$/, '');
+      }
+    }
+    return { aid, bvid, cid, p, title };
+
+  // 从播放器 active 画质菜单读取当前清晰度，读不到再用 localStorage 默认值。
+  function readQuality() {
+    let qn = 0;
+    const el = document.querySelector('.squirtle-quality-select-list li.active, .bpx-player-ctrl-quality-menu .bpx-state-active');
+    if (el) {
+      qn = Number(el.dataset.value) || 0;
+      if (!qn) {
+        const first = el.parentElement && el.parentElement.querySelector('li:first-child');
+        if (first) qn = Number(first.dataset.value) || 0;
+      }
+    }
+    if (!qn) {
+      try {
+        const s = JSON.parse(localStorage.getItem('bilibili_player_settings') || '{}');
+        qn = Number(s.setting_config && s.setting_config.defquality) || 0;
+        if (!qn) qn = Number(s.video_status && s.video_status.quality) || 0;
+      } catch (_) { /* 忽略 */ }
+    }
+    return qn || 120;
+
+  // 主动请求 playurl，复用页面 Cookie（credentials: include）。
+  // 用原始 fetch，避免被本脚本的 hook 再次捕获。
+  async function fetchPlayurl(info, qn) {
+    if (!info.aid && !info.bvid) return null;
+    const url = `//api.bilibili.com/x/player/wbi/playurl?qn=${qn}&fnver=0&fnval=4048&fourk=1`
+      + `&avid=${info.aid || 0}&bvid=${encodeURIComponent(info.bvid)}&cid=${info.cid || 0}`;
+    try {
+      const r = await origFetch(url, { credentials: 'include', cache: 'no-store' });
+      const j = await r.json();
+      if (j && j.code === 0 && j.data) return j.data;
+      return { __error: j && (j.message || j.code) || 'playurl 返回异常' };
+    } catch (e) {
+      return { __error: 'playurl 请求失败：' + (e && e.message ? e.message : '网络错误') };
+    }
+  }
+
+  // ---- 3b. 页面 state 读取（兼容入口，非主路径）----
   function readPageState() {
     const candidates = [
       window.__PLAYURL_HYDRATE_DATA__,
+      // B 站新版页面把预取 playurl 放在 __playinfo__，播放器代码里明确读它；
+      // __INITIAL_STATE__.playurl 并不存在，只留作兼容旧版。
+      window.__playinfo__,
       window.__INITIAL_STATE__ && window.__INITIAL_STATE__?.playurl,
+      window.__INITIAL_STATE__ && window.__INITIAL_STATE__?.videoData?.playinfo,
       window.__NEXT_DATA__ && window.__NEXT_DATA__?.props?.pageProps?.playurl,
     ];
     for (const c of candidates) {
@@ -172,27 +256,16 @@
     return a;
   }
 
-  function meta() {
-    const titleEl = document.querySelector('h1.video-title, .video-title, h1[title]');
-    let title = titleEl ? (titleEl.getAttribute('title') || titleEl.textContent || '') : document.title || '';
-    title = title.replace(/[_｜|]?\s*哔哩哔哩.*$/i, '').trim();
-    const bvidMatch = location.pathname.match(/(BV[0-9A-Za-z]{10})/);
-    const bvid = bvidMatch ? bvidMatch[1] : '';
-    const cidMatch = location.href.match(/[?&]p=(\d+)/);
-    const p = cidMatch ? parseInt(cidMatch[1], 10) : 1;
-    let qn = 0;
-    try {
-      const s = JSON.parse(localStorage.getItem('bilibili_player_settings') || '{}');
-      qn = s.video_status?.quality || s.quality || 0;
-    } catch (_) { /* 忽略 */ }
-    return { title: title || 'video', bvid, p, qn };
-  }
-
-  // 画质编号 → 可读名称（1080P 高清 / 4K 等），来自 playurl 的 support_formats。
+  // 画质编号 → 可读名称：support_formats 优先，
+  // 其次 accept_quality[i] ↔ accept_description[i] 映射。
   function qualityName(qn, data) {
     const fmts = (data && data.support_formats) || [];
-    const f = fmts.find((x) => x.quality === qn);
-    return f ? (f.new_description || f.description || f.format || '') : '';
+    const f = fmts.find((x) => Number(x.quality) === Number(qn));
+    if (f) return f.new_description || f.display_desc || f.description || f.format || '';
+    const aq = (data && data.accept_quality) || [];
+    const ad = (data && data.accept_description) || [];
+    const i = aq.findIndex((x) => Number(x) === Number(qn));
+    return i >= 0 ? (ad[i] || '') : '';
   }
 
   // 单条流大小估算：优先 size 字段，否则 bandwidth(bps) × 时长(ms) / 8000。
@@ -209,15 +282,26 @@
     if (e.source !== window) return;
     const d = e.data;
     if (!d || d.channel !== CHANNEL || d.to !== 'extractor' || d.type !== 'DO_EXTRACT') return;
-    const info = meta();
-    let data = pickPlayurl();
-    if (!hasDash(data)) {
-      // hook 没拿到 dash 时，回放 performance 里已发出的 playurl 请求兜底。
-      data = await replayPlayurl() || data;
+    // 主路径：取 state / 真实 cid / 清晰度，再主动请求 playurl。
+    const state = await readInitialState();
+    const info = readMetaFromState(state);
+    info.qn = readQuality();
+    if (!info.title) {
+      info.title = (document.title || 'video').replace(/[_｜|]?\s*哔哩哔哩.*$/i, '').trim() || 'video';
     }
-    const candidates = buildCandidates(data, info);
+    let data = await fetchPlayurl(info, info.qn);
+    if (!hasDash(data)) {
+      // 主动请求被拦/失败时，才回退到 hook 到的响应或 performance 回放。
+      const fallback = pickPlayurl() || await replayPlayurl();
+      if (fallback && hasDash(fallback)) data = fallback;
+    }
+    const candidates = hasDash(data) ? buildCandidates(data, info) : [];
     if (!candidates.length) {
-      post('EXTRACT_RESULT', { ok: false, error: '未找到可用的 DASH playurl 数据：请播放视频几秒，或刷新页面后重试' });
+      const err = data && data.__error ? String(data.__error) : '';
+      post('EXTRACT_RESULT', {
+        ok: false,
+        error: err ? ('playurl 请求失败：' + err) : '未找到可用的 DASH playurl 数据：请登录 B 站并刷新页面后重试',
+      });
       return;
     }
     // 默认选当前播放画质；popup 里可改选其它清晰度后再下发。
@@ -226,7 +310,7 @@
     const task = {
       id: `${info.bvid || 'unknown'}-c${info.p}-qn${sel.qn}`,
       bvid: info.bvid,
-      cid: info.p,
+      cid: info.cid || info.p,
       qn: sel.qn,
       title: info.title,
       duration: tl ? Math.round(tl / 1000) : 0,

@@ -539,14 +539,27 @@ function hideConfirm() {
 }
 
 // ---- 解析并下发 ----
+let extracting = false;
+const EXTRACT_MAX = 3;       // 总尝试次数（首次 + 2 次自重试）
+const EXTRACT_GAP_MS = 1500; // 自重试间隔：给播放器时间发起 playurl 请求
+
 $('extract').onclick = async () => {
+  if (extracting) return;
   hideConfirm();
-  $('msg').textContent = '正在分析当前视频…';
-  log('info', '请求分析当前页面…');
-  // 清空上次结果，避免提取失败时误用旧数据。
+  await runExtract(0);
+};
+
+// 分析失败/超时自动重试；每次重试前清掉上次结果，避免读到旧数据。
+async function runExtract(attempt) {
+  extracting = true;
+  $('msg').textContent = attempt === 0
+    ? '正在分析当前视频…'
+    : `分析未成功，正在自动重试（${attempt + 1}/${EXTRACT_MAX}）…`;
+  log('info', attempt === 0 ? '请求分析当前页面…' : `自动重试分析（第 ${attempt + 1} 次）`);
   await chrome.runtime.sendMessage({ type: 'CLEAR_EXTRACT' });
   const tabReply = await sendTab({ type: 'DO_EXTRACT' });
-  log('info', `DO_EXTRACT 已发送，content 应答=${tabReply ? JSON.stringify(tabReply).slice(0, 120) : '无'}`);
+  log('info', `DO_EXTRACT 已发送（第 ${attempt + 1} 次），content 应答=${tabReply ? JSON.stringify(tabReply).slice(0, 120) : '无'}`);
+
   // 主世界结果经 SW 落到 storage.session，轮询读取。
   let tries = 0;
   const timer = setInterval(async () => {
@@ -554,20 +567,30 @@ $('extract').onclick = async () => {
     const r = await chrome.runtime.sendMessage({ type: 'GET_LAST_EXTRACT' });
     if (r && r.ok) {
       clearInterval(timer);
+      extracting = false;
       log('ok', `提取成功：${r.payload.id || '?'}，qn=${r.payload.qn ?? '?'}，等待确认`);
       // 不立即下发：先展示分析结果，由用户确认。storage 里的结果保留到确认/取消时再清。
       showConfirm(r.payload);
-    } else if (r && r.ok === false) {
-      clearInterval(timer);
-      log('err', '提取失败：' + (r.error || '未知错误'));
-      $('msg').textContent = r.error || '提取失败';
-    } else if (tries > 50) {
-      clearInterval(timer);
-      log('err', '提取超时（10s 内无结果）');
-      $('msg').textContent = '提取超时：请先播放视频几秒；已播放仍失败请刷新页面后重试';
+      return;
+    }
+    const failed = !!(r && r.ok === false);
+    const timedOut = tries > 50;
+    if (!failed && !timedOut) return;
+    clearInterval(timer);
+    const reason = failed ? (r.error || '未知错误') : '10s 内无结果';
+    if (attempt + 1 < EXTRACT_MAX) {
+      log('warn', `第 ${attempt + 1} 次提取失败（${reason}），${EXTRACT_GAP_MS / 1000}s 后重试`);
+      $('msg').textContent = `${reason} · ${EXTRACT_GAP_MS / 1000}s 后自动重试（${attempt + 2}/${EXTRACT_MAX}）`;
+      setTimeout(() => runExtract(attempt + 1), EXTRACT_GAP_MS);
+    } else {
+      extracting = false;
+      log('err', `提取最终失败（共 ${EXTRACT_MAX} 次）：${reason}`);
+      $('msg').textContent = failed
+        ? reason
+        : '提取超时：请先播放视频几秒；已播放仍失败请刷新页面后重试';
     }
   }, 200);
-};
+}
 
 async function submit(task) {
   if (!task) return;
