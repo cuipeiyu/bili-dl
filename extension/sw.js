@@ -80,8 +80,13 @@ const headerFilter = {
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     if (!details.requestHeaders) return;
+    // Range 是播放器分片请求的临时状态，绝不能随任务下发：
+    // 下载端要按本地分片大小自己生成 Range，沿用抓包值会导致数据错位。
+    const skip = new Set(['range', 'accept-encoding', 'content-length', 'host',
+      'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade']);
     const headers = {};
     for (const h of details.requestHeaders) {
+      if (skip.has(String(h.name).toLowerCase())) continue;
       headers[h.name] = h.value;
     }
     // 只关心 CDN 媒体请求或 playurl 的头，存最近一组。

@@ -21,13 +21,29 @@ function capLogs(arr) {
   return arr.length > LOG_MAX ? arr.slice(-LOG_MAX) : arr;
 }
 
+function logRow(l) {
+  return `<div class="l ${l.level}"><span class="t">${l.ts}</span> <span class="m">${esc(l.msg)}</span></div>`;
+}
+
 function log(level, msg) {
   const t = new Date();
   const ts = [t.getHours(), t.getMinutes(), t.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':')
     + '.' + String(t.getMilliseconds()).padStart(3, '0');
-  logs.push({ at: t.getTime(), ts, level, msg: String(msg) });
-  logs = capLogs(logs);
-  renderLog();
+  const row = { at: t.getTime(), ts, level, msg: String(msg) };
+  logs.push(row);
+  const trimmed = capLogs(logs);
+  const removed = logs.length - trimmed.length;
+  logs = trimmed;
+  // 增量追加单行，不再重建全部 DOM——日志密集时全量innerHTML是CPU热点。
+  const box = $('log');
+  if (box) {
+    if (removed > 0 && box.firstChild) {
+      for (let i = 0; i < removed && box.firstChild; i++) box.removeChild(box.firstChild);
+    }
+    box.insertAdjacentHTML('beforeend', logRow(row));
+    $('logcount').textContent = logs.length;
+    box.scrollTop = box.scrollHeight;
+  }
   chrome.storage.session.set({ [LOG_KEY]: logs }, () => {
     if (chrome.runtime.lastError) { /* session 不可用时静默 */ }
   });
@@ -36,9 +52,7 @@ function log(level, msg) {
 function renderLog() {
   const box = $('log');
   if (!box) return;
-  box.innerHTML = logs.map((l) =>
-    `<div class="l ${l.level}"><span class="t">${l.ts}</span> <span class="m">${esc(l.msg)}</span></div>`
-  ).join('');
+  box.innerHTML = logs.map(logRow).join('');
   $('logcount').textContent = logs.length;
   box.scrollTop = box.scrollHeight;
 }
@@ -311,13 +325,15 @@ async function connect() {
         log('info', `WS snapshot：${ev.tasks.length} 个任务`);
         render(ev.tasks);
       }
-      if (ev.type === 'task.updated') {
-        log('info', `任务更新 ${ev.task ? ev.task.id + ' → ' + ev.task.state : ''}`);
-        fetchTasks();
+      if (ev.type === 'task.updated' && ev.task) {
+        // 消息自带完整 task，直接局部更新 DOM；不再每次 REST 往返全量重建。
+        upsertTask(ev.task);
       }
-      if (ev.type === 'task.deleted') {
-        log('info', '任务删除');
-        fetchTasks();
+      if (ev.type === 'task.deleted' && ev.task) {
+        taskCache = taskCache.filter((x) => x.id !== ev.task.id);
+        const li = $('tasks').querySelector(`li[data-tid="${CSS.escape(ev.task.id)}"]`);
+        if (li) li.remove();
+        if (!taskCache.length) $('tasks').innerHTML = '<li style="color:#888">暂无任务</li>';
       }
     } catch (err) {
       log('warn', 'WS 消息解析失败：' + err.message);
@@ -367,60 +383,81 @@ function fetchTasks() {
     .catch(() => {});
 }
 
+let taskCache = []; // 当前任务列表缓存，供 WS 局部更新使用
+
+function taskHtml(t) {
+  const pct = Math.round(t.progress || 0);
+
+  // 下载中：分三阶段展示，视频/音频各自进度条 + 合并阶段。
+  let stageHtml = '';
+  if (t.state === 'downloading') {
+    const v = Math.round(t.video_pct || 0);
+    const a = Math.round(t.audio_pct || 0);
+    const vs = esc(t.video_speed || '0 B/s');
+    const as = esc(t.audio_speed || '0 B/s');
+    stageHtml = `
+      <div class="substage">
+        <div class="subrow"><span class="lab">▸ 视频流</span><span class="num">${v}% · ${vs}</span></div>
+        <div class="bar thin"><i style="width:${v}%"></i></div>
+        <div class="subrow"><span class="lab">▸ 音频流</span><span class="num">${a}% · ${as}</span></div>
+        <div class="bar thin"><i style="width:${a}%"></i></div>
+        <div class="subrow"><span class="lab pending">○ 合并</span><span class="num">等待</span></div>
+      </div>`;
+  } else if (t.state === 'merging') {
+    const m = Math.round(t.merge_pct || 0);
+    stageHtml = `
+      <div class="substage">
+        <div class="subrow"><span class="lab done">✓ 视频流</span><span class="num">100%</span></div>
+        <div class="subrow"><span class="lab done">✓ 音频流</span><span class="num">100%</span></div>
+        <div class="subrow"><span class="lab">▸ 合并</span><span class="num">${m}%</span></div>
+        <div class="bar thin"><i style="width:${m}%"></i></div>
+      </div>`;
+  }
+
+  // 操作按钮：进行中可暂停，暂停/失败可继续，任何状态可移除。
+  const active = t.state === 'pending' || t.state === 'downloading' || t.state === 'merging';
+  const resumable = t.state === 'paused' || t.state === 'failed';
+  let actions = '';
+  if (active) actions += `<button class="mini" data-act="pause" data-id="${esc(t.id)}">暂停</button>`;
+  if (resumable) actions += `<button class="mini" data-act="resume" data-id="${esc(t.id)}">继续</button>`;
+  actions += `<button class="mini warn" data-act="remove" data-id="${esc(t.id)}">移除</button>`;
+
+  return `
+    <div class="title">${esc(t.title || t.id)}</div>
+    ${t.state === 'downloading' || t.state === 'merging' ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}
+    ${stageHtml}
+    ${t.output_path && t.state !== 'done' ? `<div class="meta">目标：${esc(t.output_path)}</div>` : ''}
+    ${t.output ? `<div class="meta done">✓ 已保存：${esc(t.output)}</div>` : ''}
+    <div class="acts">${actions}</div>
+  `;
+}
+
+// 合并单个任务到缓存，并增量更新对应 <li>（无则整表重建）。
+function upsertTask(nt) {
+  const i = taskCache.findIndex((x) => x.id === nt.id);
+  if (i >= 0) taskCache[i] = nt;
+  else taskCache.push(nt);
+  const ul = $('tasks');
+  let li = ul.querySelector(`li[data-tid="${CSS.escape(nt.id)}"]`);
+  if (!li) {
+    render(taskCache);
+    return;
+  }
+  li.innerHTML = taskHtml(nt);
+}
+
 function render(tasks) {
   const ul = $('tasks');
+  taskCache = Array.isArray(tasks) ? tasks.slice() : [];
   ul.innerHTML = '';
-  if (!tasks || !tasks.length) {
+  if (!taskCache.length) {
     ul.innerHTML = '<li style="color:#888">暂无任务</li>';
     return;
   }
-  for (const t of tasks) {
+  for (const t of taskCache) {
     const li = document.createElement('li');
-    const stateCls = t.state === 'done' ? 'done' : (t.state === 'failed' ? 'failed' : '');
-    const pct = Math.round(t.progress || 0);
-    const stage = t.stage ? esc(t.stage) : stateText(t.state);
-
-    // 下载中：分三阶段展示，视频/音频各自进度条 + 合并阶段。
-    let stageHtml = '';
-    if (t.state === 'downloading') {
-      const v = Math.round(t.video_pct || 0);
-      const a = Math.round(t.audio_pct || 0);
-      const vs = esc(t.video_speed || '0 B/s');
-      const as = esc(t.audio_speed || '0 B/s');
-      stageHtml = `
-        <div class="substage">
-          <div class="subrow"><span class="lab">▸ 视频流</span><span class="num">${v}% · ${vs}</span></div>
-          <div class="bar thin"><i style="width:${v}%"></i></div>
-          <div class="subrow"><span class="lab">▸ 音频流</span><span class="num">${a}% · ${as}</span></div>
-          <div class="bar thin"><i style="width:${a}%"></i></div>
-          <div class="subrow"><span class="lab pending">○ 合并</span><span class="num">等待</span></div>
-        </div>`;
-    } else if (t.state === 'merging') {
-      stageHtml = `
-        <div class="substage">
-          <div class="subrow"><span class="lab done">✓ 视频流</span><span class="num">100%</span></div>
-          <div class="subrow"><span class="lab done">✓ 音频流</span><span class="num">100%</span></div>
-          <div class="subrow"><span class="lab">▸ 合并</span><span class="num">进行中</span></div>
-        </div>`;
-    }
-
-    // 操作按钮：进行中可暂停，暂停/失败可继续，任何状态可移除。
-    const active = t.state === 'pending' || t.state === 'downloading' || t.state === 'merging';
-    const resumable = t.state === 'paused' || t.state === 'failed';
-    let actions = '';
-    if (active) actions += `<button class="mini" data-act="pause" data-id="${esc(t.id)}">暂停</button>`;
-    if (resumable) actions += `<button class="mini" data-act="resume" data-id="${esc(t.id)}">继续</button>`;
-    actions += `<button class="mini warn" data-act="remove" data-id="${esc(t.id)}">移除</button>`;
-
-    li.innerHTML = `
-      <div class="title">${esc(t.title || t.id)}</div>
-      <div class="meta ${stateCls}">${stage} · ${pct}%${t.stage_text ? ' · ' + esc(t.stage_text) : ''}${t.error ? ' · ' + esc(t.error) : ''}</div>
-      ${t.state === 'downloading' || t.state === 'merging' ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}
-      ${stageHtml}
-      ${t.output_path && t.state !== 'done' ? `<div class="meta">目标：${esc(t.output_path)}</div>` : ''}
-      ${t.output ? `<div class="meta done">✓ 已保存：${esc(t.output)}</div>` : ''}
-      <div class="acts">${actions}</div>
-    `;
+    li.dataset.tid = t.id;
+    li.innerHTML = taskHtml(t);
     ul.appendChild(li);
   }
 }

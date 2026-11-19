@@ -29,10 +29,10 @@ var invalidName = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1f]`)
 // byteLimiter 是简单的令牌桶，按字节限速，供两路下载共享以限制总带宽。
 // 0 速率表示不限速。
 type byteLimiter struct {
-	mu      sync.Mutex
-	rate    float64 // bytes per second
-	tokens  float64
-	last    time.Time
+	mu     sync.Mutex
+	rate   float64 // bytes per second
+	tokens float64
+	last   time.Time
 }
 
 func newByteLimiter(rateKBPS int) *byteLimiter {
@@ -123,8 +123,8 @@ func New(cfg config.Config) *Pipeline {
 		// 卡死检测改在读取循环里用「空闲超时」判断（见 downloadOnce）。
 		client: &http.Client{
 			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 4,
-				IdleConnTimeout:     30 * time.Second,
+				MaxIdleConnsPerHost:   4,
+				IdleConnTimeout:       30 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second, // 仅限制「等响应头」阶段
 			},
 		},
@@ -151,16 +151,54 @@ func (p *Pipeline) SpeedLimit() int { return p.limiter.RateKBPS() }
 
 // streamProgress 跟踪单条流的下载进度，各自独立，避免两路 total 互相覆盖。
 type streamProgress struct {
-	mu       sync.Mutex
-	written  int64
-	total    int64
-	pct      float64
-	lastLog  time.Time // 最近一次打进度日志的时间，用于节流
+	mu      sync.Mutex
+	written int64
+	total   int64
+	pct     float64
+	lastLog time.Time // 最近一次打进度日志的时间，用于节流
 	// 速度采样：以最近 ~1 秒窗口内的字节增量计算，避免瞬时抖动。
-	winStart time.Time
-	winBytes int64
-	speedBps float64
+	winStart     time.Time
+	winBytes     int64
+	speedBps     float64
 	lastReported int64 // 上次上报的绝对字节数，用于算速度增量（续传重试不会重复计）
+	finished     bool  // 该流已下载完成，速度固定为 0
+}
+
+// downloadOverall 按两路「已下载字节 / 总字节」加权算下载阶段总进度，结果落在 [0, span]。
+// 体积小的音频完成得快，按字节加权后不会像百分比平均那样把总进度虚抬高。
+// 任一路总长未知（<=0）时，该路退回用自身百分比折算成等价字节参与加权。
+func downloadOverall(vw, vt int64, vpct float64, aw, at int64, apct float64, span float64) float64 {
+	if vt > 0 && at > 0 {
+		// 两路总量都已知：按字节加权，结果钳制到 [0, span]。
+		pct := float64(vw+aw) / float64(vt+at) * span
+		if pct > span {
+			return span
+		}
+		if pct < 0 {
+			return 0
+		}
+		return pct
+	}
+	// 任一路总量未知，无法可靠加权，退回两路百分比平均。
+	pct := (vpct + apct) / 2 / 100 * span
+	if pct > span {
+		return span
+	}
+	if pct < 0 {
+		return 0
+	}
+	return pct
+}
+
+// finish 在流下载完成后调用：保留进度与字节数，但清掉所有速度采样。
+// 否则最后一次窗口的速度会一直残留，导致已完成的流仍显示速度。
+func (sp *streamProgress) finish() {
+	sp.mu.Lock()
+	sp.finished = true
+	sp.speedBps = 0
+	sp.winBytes = 0
+	sp.winStart = time.Time{}
+	sp.mu.Unlock()
 }
 
 // report 接收「绝对已下载字节数」与总字节数。用绝对值而非增量，
@@ -196,6 +234,9 @@ func (sp *streamProgress) report(written, totalHint int64) {
 func (sp *streamProgress) snapshot() (pct float64, written, total int64, speed string) {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
+	if sp.finished {
+		return sp.pct, sp.written, sp.total, humanSpeed(0)
+	}
 	// 窗口未满 1 秒时，用已累积字节/已过时间给一个即时估算，避免速度长时间显示 0。
 	bps := sp.speedBps
 	if !sp.winStart.IsZero() {
@@ -260,6 +301,9 @@ func (p *Pipeline) Run(ctx context.Context, t *model.Task, update func(*model.Ta
 	t.Progress = 0
 	t.VideoPct = 0
 	t.AudioPct = 0
+	t.VideoSpeed = humanSpeed(0)
+	t.AudioSpeed = humanSpeed(0)
+	t.StageText = ""
 	t.Error = ""
 	update(t)
 
@@ -284,8 +328,25 @@ func (p *Pipeline) Run(ctx context.Context, t *model.Task, update func(*model.Ta
 	vp := &streamProgress{lastLog: time.Now()}
 	ap := &streamProgress{lastLog: time.Now()}
 
-	// 合并两路进度到任务：总进度取两路平均，各流单独字段供 popup 分条展示。
+	// 总进度（Progress）单调映射到 0-100：下载阶段按两路字节数加权占 0-95%，
+	// 合并阶段用 ffmpeg 真实进度占 95-100%。不再取两路百分比平均，避免
+	// 体积很小的音频一下完就把总进度虚抬到 50% 以上；也不会在进入合并时回退到 0。
+	// 各流单独百分比仍写 video_pct/audio_pct/merge_pct 供 popup 分条展示。
+	// 每 128KB chunk 都会走到这里，直接 update 会让 WS 每秒广播上百次，
+	// 把 popup 的 DOM 重建/日志渲染压垮。按时间节流到 ~5 帧/秒，肉眼仍平滑。
+	const downloadSpan = 95.0
+	var lastPush time.Time
+	var lastStage string
+	var lastOverall float64
 	syncTask := func(stage string) {
+		now := time.Now()
+		// 阶段切换（如进入合并）必须立刻推，不受节流限制。
+		if stage == lastStage && now.Sub(lastPush) < 200*time.Millisecond {
+			return
+		}
+		lastPush = now
+		lastStage = stage
+
 		vpct, vw, vt, vspeed := vp.snapshot()
 		apct, aw, at, aspeed := ap.snapshot()
 		cp := *t
@@ -294,7 +355,13 @@ func (p *Pipeline) Run(ctx context.Context, t *model.Task, update func(*model.Ta
 		cp.AudioPct = apct
 		cp.VideoSpeed = vspeed
 		cp.AudioSpeed = aspeed
-		cp.Progress = (vpct + apct) / 2
+		overall := downloadOverall(vw, vt, vpct, aw, at, apct, downloadSpan)
+		// 单调钳制：字节数只会增加，但重试/续传起点变化时也绝不回退。
+		if overall < lastOverall {
+			overall = lastOverall
+		}
+		lastOverall = overall
+		cp.Progress = overall
 		cp.StageText = fmt.Sprintf("视频 %s/%s @ %s · 音频 %s/%s @ %s",
 			humanSize(vw), humanSize(vt), vspeed, humanSize(aw), humanSize(at), aspeed)
 		update(&cp)
@@ -331,6 +398,7 @@ func (p *Pipeline) Run(ctx context.Context, t *model.Task, update func(*model.Ta
 			return
 		}
 		pct, written, total, _ := sp.snapshot()
+		sp.finish() // 这条流已下完：速度立刻归零，不再残留最后的采样值
 		L.WithFields(log.Fields{"stream": label, "bytes": humanSize(written),
 			"total": humanSize(total), "pct": fmt.Sprintf("%.0f%%", pct)}).Info("流下载完成")
 	}
@@ -350,9 +418,18 @@ func (p *Pipeline) Run(ctx context.Context, t *model.Task, update func(*model.Ta
 		return p.fail(t, update, err)
 	}
 
+	// 合并前最后一道校验：两路分片都必须是有效媒体，杜绝错误页/空文件进入 ffmpeg。
+	for _, part := range []struct{ path, label string }{
+		{videoPath, "视频流"}, {audioPath, "音频流"},
+	} {
+		if verr := validateDownloadedFile(part.path); verr != nil {
+			return p.fail(t, update, fmt.Errorf("%s分片无效：%w", part.label, verr))
+		}
+	}
+
 	t.State = model.StateMerging
 	t.Stage = "等待合并"
-	t.Progress = 99
+	t.Progress = 95
 	syncTask("等待合并")
 	L.Info("两路下载完成，已投递合并队列")
 
@@ -416,12 +493,88 @@ func (p *Pipeline) download(ctx context.Context, stream model.Stream, dest, task
 	return 0, 0, lastErr
 }
 
+// parseContentRange 解析 "bytes N-M/T"，返回起点、终点、总大小。
+func parseContentRange(cr string) (start, end, total int64, ok bool) {
+	cr = strings.TrimSpace(cr)
+	if !strings.HasPrefix(strings.ToLower(cr), "bytes ") {
+		return 0, 0, 0, false
+	}
+	spec := strings.TrimSpace(cr[len("bytes "):])
+	slash := strings.LastIndexByte(spec, '/')
+	if slash < 0 {
+		return 0, 0, 0, false
+	}
+	rangePart := spec[:slash]
+	sizePart := spec[slash+1:]
+	dash := strings.IndexByte(rangePart, '-')
+	if dash < 0 {
+		return 0, 0, 0, false
+	}
+	var err error
+	if start, err = strconv.ParseInt(strings.TrimSpace(rangePart[:dash]), 10, 64); err != nil || start < 0 {
+		return 0, 0, 0, false
+	}
+	if end, err = strconv.ParseInt(strings.TrimSpace(rangePart[dash+1:]), 10, 64); err != nil || end < start {
+		return 0, 0, 0, false
+	}
+	if sizePart != "*" {
+		if total, err = strconv.ParseInt(strings.TrimSpace(sizePart), 10, 64); err != nil || total <= 0 {
+			return 0, 0, 0, false
+		}
+	}
+	return start, end, total, true
+}
+
 // existingSize 返回 .part 文件当前大小；不存在返回 0。
 func existingSize(dest string) int64 {
 	if fi, err := os.Stat(dest); err == nil {
 		return fi.Size()
 	}
 	return 0
+}
+
+// badContentType 判断响应体是否为错误页而非媒体数据。
+// B 站 CDN 在鉴权失败/直链过期时可能返回 200 + HTML/JSON，绝不能写进分片。
+func badContentType(ct string) bool {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	if strings.HasPrefix(ct, "text/") {
+		return true
+	}
+	return ct == "application/json" || ct == "application/xml"
+}
+
+// looksLikeErrorBody 检查分片开头是否是 HTML/JSON/XML 错误页。
+// fMP4 前几个字节是 box 长度 + "ftyp"，FLV 是 "FLV"，都不是这些字符。
+func looksLikeErrorBody(head []byte) bool {
+	s := strings.TrimSpace(string(head))
+	if s == "" {
+		return true
+	}
+	return s[0] == '<' || s[0] == '{' || s[0] == '['
+}
+
+// validateDownloadedFile 在下载完成后校验分片可用，避免把错误页或空文件送去合并。
+func validateDownloadedFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("分片不可读: %w", err)
+	}
+	defer f.Close()
+	head := make([]byte, 512)
+	n, err := f.Read(head)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("分片读取失败: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("分片为空")
+	}
+	if looksLikeErrorBody(head[:n]) {
+		return fmt.Errorf("分片内容是错误响应（HTML/JSON），直链可能已过期或防盗链失败")
+	}
+	return nil
 }
 
 // downloadOnce 执行一次 HTTP 下载，支持 Range 断点续传与空闲超时：
@@ -440,6 +593,11 @@ func (p *Pipeline) downloadOnce(ctx context.Context, stream model.Stream, dest s
 		}
 		req.Header.Set(k, v)
 	}
+	// Range 必须由本端按 .part 实际大小生成，绝不能用抓包带来的值。
+	// 播放器抓到的是它自己的分片范围（如 bytes=2519549-2626807），
+	// 原样发出会让服务端返回中间片段，却被当作从 0 开始写入，文件整体错位。
+	// 即使 have=0 也要 Del，避免首次下载沿用抓包 Range。
+	req.Header.Del("Range")
 	if have > 0 {
 		req.Header.Set("Range", "bytes="+strconv.FormatInt(have, 10)+"-")
 	}
@@ -466,12 +624,20 @@ func (p *Pipeline) downloadOnce(ctx context.Context, stream model.Stream, dest s
 	case http.StatusPartialContent: // 206
 		base = have
 		appendMode = true
-		// Content-Range: bytes N-M/T 里的 T 是完整大小；退回用 N + 本次 ContentLength。
+		// Content-Range: bytes N-M/T，T 是完整大小，N 是本次数据起点。
+		// 必须校验 N==have：若服务端忽略/改写 Range，返回的是别的偏移片段，
+		// 照常追加会造成文件错位且总字节数碰巧对得上，最终送进 ffmpeg 才暴露为 Invalid data。
 		total = have + resp.ContentLength
 		if cr := resp.Header.Get("Content-Range"); cr != "" {
-			if slash := strings.LastIndex(cr, "/"); slash >= 0 {
-				if t, e := strconv.ParseInt(strings.TrimSpace(cr[slash+1:]), 10, 64); e == nil && t > 0 {
-					total = t
+			start, end, size, ok := parseContentRange(cr)
+			if ok {
+				if start != have {
+					return have, 0, fmt.Errorf("Range 响应起点不符：请求 %d，返回 %d（%s）", have, start, cr)
+				}
+				if size > 0 {
+					total = size
+				} else if end >= start {
+					total = end + 1
 				}
 			}
 		}
@@ -479,9 +645,35 @@ func (p *Pipeline) downloadOnce(ctx context.Context, stream model.Stream, dest s
 		base = 0
 		total = resp.ContentLength
 	case http.StatusRequestedRangeNotSatisfiable: // 416：请求范围不满足
-		return have, have, nil
+		// 只有分片确实已完整（have>0 且内容有效）才算续传完成。
+		// 直接从零字节走 416 会返回成功但根本没有文件，合并必然失败。
+		if have > 0 {
+			if verr := validateDownloadedFile(dest); verr == nil {
+				return have, have, nil
+			}
+			// 分片损坏：删掉从零重下，下面按 200 覆盖处理。
+			os.Remove(dest)
+			have = 0
+			req.Header.Del("Range")
+			log.WithFields(log.Fields{"stream": labelOf(dest), "reason": "416 但分片损坏"}).Warn("丢弃损坏分片，重新下载")
+			return p.downloadOnce(ctx, stream, dest, report)
+		}
+		return have, 0, fmt.Errorf("status=416 且无已下载分片")
 	default:
 		return have, 0, fmt.Errorf("status=%d", resp.StatusCode)
+	}
+
+	// 内容类型检查：防止把 CDN 返回的 HTML/JSON 错误页当媒体写入分片。
+	if badContentType(resp.Header.Get("Content-Type")) {
+		return have, 0, fmt.Errorf("响应不是媒体数据（Content-Type=%s），直链可能已过期", resp.Header.Get("Content-Type"))
+	}
+
+	// 磁盘空间预检：输出目录至少要有 2 倍体积可用（分片 1 份 + 合并临时产物 1 份）。
+	// 续传时已落盘的 base 属于第一份的一部分，从需求里扣掉，避免误报。
+	if need := total*diskReserveFactor - base; need > 0 {
+		if err := ensureDiskSpace(filepath.Dir(dest), need, labelOf(dest)+"下载"); err != nil {
+			return base, total, err
+		}
 	}
 
 	flags := os.O_WRONLY | os.O_CREATE
@@ -549,6 +741,11 @@ func (p *Pipeline) downloadOnce(ctx context.Context, stream model.Stream, dest s
 			report(written, total)
 		}
 		if rerr == io.EOF {
+			// 字节数不足说明连接被提前截断，必须当失败触发续传，
+			// 否则不完整的分片会被当成功送进合并，ffmpeg 报 Invalid data。
+			if total > 0 && written < total {
+				return written, total, fmt.Errorf("下载不完整：%d/%d 字节，连接被提前关闭", written, total)
+			}
 			break
 		}
 		if rerr != nil {
@@ -587,8 +784,15 @@ func (p *Pipeline) mergeLoop() {
 	}
 }
 
+// zeroSpeeds 把任务上的流速度归零，用于合并/失败等非下载中状态。
+func zeroSpeeds(t *model.Task) {
+	t.VideoSpeed = humanSpeed(0)
+	t.AudioSpeed = humanSpeed(0)
+}
+
 func (p *Pipeline) doMerge(job mergeJob) {
 	t := job.task
+	zeroSpeeds(t) // 进入合并即不再下载，速度固定为 0
 	L := log.WithField("task", t.ID)
 	if job.done != nil {
 		defer job.done()
@@ -616,9 +820,23 @@ func (p *Pipeline) doMerge(job mergeJob) {
 	}
 	tmpOut := outPath + ".tmp"
 
+	// 合并前精确校验：分片已在盘上占了一份，tmpOut 还要再写一份同等体积。
+	// 用分片实际大小（视频 + 音频）而非预估，避免下载阶段单路粗筛的误差漏网。
+	partBytes := existingSize(job.videoPath) + existingSize(job.audioPath)
+	if err := ensureDiskSpace(filepath.Dir(tmpOut), partBytes, "合并产物"); err != nil {
+		cp := *t
+		cp.State = model.StateFailed
+		cp.Stage = "合并空间不足"
+		cp.Error = err.Error()
+		job.update(&cp)
+		L.WithError(err).Error("合并前磁盘空间检查失败")
+		return
+	}
+
 	cp := *t
 	cp.Stage = "合并中"
-	cp.Progress = 99
+	cp.Progress = 95 // 下载已完成 95%，合并阶段从 95 起，绝不回退
+	cp.MergePct = 0
 	cp.StageText = "ffmpeg 正在封装 MP4"
 	job.update(&cp)
 	L.WithFields(log.Fields{"ffmpeg": p.cfg.FFmpeg, "output": outName}).Info("开始合并（ffmpeg -c copy）")
@@ -629,6 +847,7 @@ func (p *Pipeline) doMerge(job mergeJob) {
 	}
 	cmd := exec.CommandContext(jobCtx, p.cfg.FFmpeg,
 		"-y", "-hide_banner", "-loglevel", "error",
+		"-nostats", "-progress", "pipe:1",
 		"-i", job.videoPath, "-i", job.audioPath,
 		"-map", "0:v:0", "-map", "1:a:0",
 		"-c", "copy", "-movflags", "+faststart",
@@ -638,8 +857,55 @@ func (p *Pipeline) doMerge(job mergeJob) {
 	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		os.Remove(tmpOut)
+		cp := *t
+		cp.State = model.StateFailed
+		cp.Stage = "合并失败"
+		cp.Error = "建立进度管道失败: " + err.Error()
+		job.update(&cp)
+		L.WithError(err).Error("建立进度管道失败")
+		return
+	}
+
+	// 进度回调在独立 goroutine 里触发：构造独立副本推送，不共享循环外的 cp。
+	merged := newMergeProgress(t.Duration, func(pct float64) {
+		if pct < 0 {
+			pct = 0
+		} else if pct > 100 {
+			pct = 100
+		}
+		pc := *t
+		pc.State = model.StateMerging
+		pc.Stage = "合并中"
+		pc.MergePct = pct           // 真实合并百分比，供 popup 合并子行显示
+		pc.Progress = 95 + pct*0.05 // 总进度尾段 95→100
+		pc.StageText = "ffmpeg 正在封装 MP4"
+		job.update(&pc)
+	})
+
 	start := time.Now()
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		os.Remove(tmpOut)
+		cp := *t
+		cp.State = model.StateFailed
+		cp.Stage = "合并失败"
+		cp.Error = "ffmpeg 启动失败: " + err.Error()
+		job.update(&cp)
+		L.WithError(err).Error("ffmpeg 启动失败")
+		return
+	}
+	// 必须在 Wait 前把 stdout 读完，否则管道写满会阻塞 ffmpeg。
+	progressDone := make(chan struct{})
+	go func() {
+		merged.scan(stdout)
+		close(progressDone)
+	}()
+	waitErr := cmd.Wait()
+	<-progressDone
+
+	if waitErr != nil {
 		os.Remove(tmpOut)
 		if jobCtx.Err() != nil {
 			L.Info("合并被取消，跳过失败标记")
@@ -648,9 +914,11 @@ func (p *Pipeline) doMerge(job mergeJob) {
 		cp := *t
 		cp.State = model.StateFailed
 		cp.Stage = "合并失败"
-		cp.Error = "ffmpeg 合并失败: " + strings.TrimSpace(stderr.String()) + " " + err.Error()
+		cp.Error = "ffmpeg 合并失败: " + strings.TrimSpace(stderr.String()) + " " + waitErr.Error()
 		job.update(&cp)
-		L.WithError(err).Error("合并失败")
+		L.WithFields(log.Fields{
+			"stderr": strings.TrimSpace(stderr.String()),
+		}).WithError(waitErr).Error("合并失败")
 		return
 	}
 	if err := os.Rename(tmpOut, outPath); err != nil {
@@ -668,6 +936,7 @@ func (p *Pipeline) doMerge(job mergeJob) {
 	cp.Stage = "完成"
 	cp.StageText = ""
 	cp.Progress = 100
+	cp.MergePct = 100
 	cp.Output = outName
 	job.update(&cp)
 
@@ -685,6 +954,7 @@ func (p *Pipeline) doMerge(job mergeJob) {
 }
 
 func (p *Pipeline) fail(t *model.Task, update func(*model.Task), err error) error {
+	zeroSpeeds(t)
 	cp := *t
 	cp.State = model.StateFailed
 	cp.Stage = "下载失败"
