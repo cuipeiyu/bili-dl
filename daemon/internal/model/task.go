@@ -30,6 +30,8 @@ type Task struct {
 	QN         int       `json:"qn,omitempty"`
 	Title      string    `json:"title,omitempty"`
 	Duration   int64     `json:"duration,omitempty"`
+	VideoSize  int64     `json:"video_size,omitempty"`  // 视频流真实字节数（下载时由 Content-Range 得到）
+	AudioSize  int64     `json:"audio_size,omitempty"`  // 音频流真实字节数
 	OutputPath string    `json:"output_path,omitempty"` // 用户指定的保存路径，相对 OutputRoot，可含子目录
 	Video      Stream    `json:"video"`
 	Audio      Stream    `json:"audio"`

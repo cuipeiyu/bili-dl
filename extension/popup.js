@@ -395,20 +395,24 @@ function taskHtml(t) {
     const a = Math.round(t.audio_pct || 0);
     const vs = esc(t.video_speed || '0 B/s');
     const as = esc(t.audio_speed || '0 B/s');
+    const vSize = t.video_size ? humanSize(t.video_size) : '';
+    const aSize = t.audio_size ? humanSize(t.audio_size) : '';
     stageHtml = `
       <div class="substage">
-        <div class="subrow"><span class="lab">▸ 视频流</span><span class="num">${v}% · ${vs}</span></div>
+        <div class="subrow"><span class="lab">▸ 视频流${vSize ? ' · ' + vSize : ''}</span><span class="num">${v}% · ${vs}</span></div>
         <div class="bar thin"><i style="width:${v}%"></i></div>
-        <div class="subrow"><span class="lab">▸ 音频流</span><span class="num">${a}% · ${as}</span></div>
+        <div class="subrow"><span class="lab">▸ 音频流${aSize ? ' · ' + aSize : ''}</span><span class="num">${a}% · ${as}</span></div>
         <div class="bar thin"><i style="width:${a}%"></i></div>
         <div class="subrow"><span class="lab pending">○ 合并</span><span class="num">等待</span></div>
       </div>`;
   } else if (t.state === 'merging') {
     const m = Math.round(t.merge_pct || 0);
+    const vSize = t.video_size ? humanSize(t.video_size) : '';
+    const aSize = t.audio_size ? humanSize(t.audio_size) : '';
     stageHtml = `
       <div class="substage">
-        <div class="subrow"><span class="lab done">✓ 视频流</span><span class="num">100%</span></div>
-        <div class="subrow"><span class="lab done">✓ 音频流</span><span class="num">100%</span></div>
+        <div class="subrow"><span class="lab done">✓ 视频流${vSize ? ' · ' + vSize : ''}</span><span class="num">100%</span></div>
+        <div class="subrow"><span class="lab done">✓ 音频流${aSize ? ' · ' + aSize : ''}</span><span class="num">100%</span></div>
         <div class="subrow"><span class="lab">▸ 合并</span><span class="num">${m}%</span></div>
         <div class="bar thin"><i style="width:${m}%"></i></div>
       </div>`;

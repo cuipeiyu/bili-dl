@@ -355,6 +355,12 @@ func (p *Pipeline) Run(ctx context.Context, t *model.Task, update func(*model.Ta
 		cp.AudioPct = apct
 		cp.VideoSpeed = vspeed
 		cp.AudioSpeed = aspeed
+		if vt > 0 {
+			cp.VideoSize = vt
+		}
+		if at > 0 {
+			cp.AudioSize = at
+		}
 		overall := downloadOverall(vw, vt, vpct, aw, at, apct, downloadSpan)
 		// 单调钳制：字节数只会增加，但重试/续传起点变化时也绝不回退。
 		if overall < lastOverall {
@@ -408,6 +414,19 @@ func (p *Pipeline) Run(ctx context.Context, t *model.Task, update func(*model.Ta
 	go download("音频流", "下载音频流", hostOf(t.Audio.URL), t.Audio, audioPath, ap)
 	wg.Wait()
 	close(errCh)
+
+	// 两路真实字节数写回任务本体（syncTask 改的是副本，合并阶段拿的是 t）。
+	// 下载中途也可能已由 syncTask 推过，这里以最终落盘字节为准覆盖。
+	if _, vw, vt, _ := vp.snapshot(); vt > 0 {
+		t.VideoSize = vt
+	} else if vw > 0 {
+		t.VideoSize = vw
+	}
+	if _, aw, at, _ := ap.snapshot(); at > 0 {
+		t.AudioSize = at
+	} else if aw > 0 {
+		t.AudioSize = aw
+	}
 
 	// 被取消：保留 .part 供继续下载时断点续传，不清理、不标记失败。
 	if ctx.Err() != nil {
