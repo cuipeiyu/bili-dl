@@ -1,0 +1,19 @@
+services:
+  bili-dl:
+    image: bili-dl:latest
+    container_name: bili-dl
+    restart: unless-stopped
+    ports:
+      - "18080:18080"
+    environment:
+      BILIDL_ADDR: ":18080"
+      BILIDL_TOKEN: "请改成强随机令牌"
+      BILIDL_OUTPUT_ROOT: "/data"
+      BILIDL_STATE_FILE: "/data/tasks.json"
+      BILIDL_MERGE_WORKERS: "2"
+      BILIDL_DOWNLOAD_TRIES: "3"
+      BILIDL_HTTP_IDLE_TIMEOUT_SEC: "30"
+      BILIDL_LOG_LEVEL: "info"
+      BILIDL_SPEED_LIMIT_KBPS: "0"
+    volumes:
+      - /volume1/docker/bili-dl/data:/data

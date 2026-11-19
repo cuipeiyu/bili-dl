@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>bili-dl</title>
+  <style>
+    body { font-family: system-ui, sans-serif; width: 340px; margin: 0; padding: 14px; color: #eaeaea; background: #1e1e1e; }
+    h1 { font-size: 15px; margin: 0 0 10px; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    button { padding: 7px 12px; font-size: 12px; cursor: pointer; background: #2d7d46; color: #fff; border: 0; border-radius: 4px; }
+    button.ghost { background: #444; }
+    button.mini { padding: 3px 8px; font-size: 10px; background: #444; }
+    button.mini.warn { background: #7a3b3b; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    button[hidden] { display: none; }
+    #retry { min-width: 122px; font-variant-numeric: tabular-nums; }
+    /* 顶部设置手风琴 */
+    details#cfgbox { border: 1px solid #333; border-radius: 4px; margin-bottom: 10px; background: #242424; }
+    details#cfgbox summary { cursor: pointer; padding: 6px 9px; font-size: 11px; color: #9bb7d4; list-style: none; user-select: none; }
+    details#cfgbox summary::-webkit-details-marker { display: none; }
+    details#cfgbox summary::before { content: '▸ '; }
+    details#cfgbox[open] summary::before { content: '▾ '; }
+    details#cfgbox .cfgbody { padding: 2px 9px 9px; }
+    details#cfgbox label { display: block; font-size: 11px; color: #999; margin-top: 7px; }
+    details#cfgbox input { width: 100%; box-sizing: border-box; margin-top: 3px; padding: 5px 7px; font-size: 12px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #eaeaea; border-radius: 3px; }
+    details#cfgbox .hint { font-size: 10px; color: #6a7f95; margin-top: 6px; }
+    #cfgstatus { font-size: 10px; color: #7ee2a8; min-height: 12px; margin-top: 4px; }
+    #conn { font-size: 12px; padding: 4px 8px; border-radius: 4px; }
+    #conn.on { background: #1b4d2e; color: #7ee2a8; }
+    #conn.off { background: #4d1b1b; color: #f08a8a; }
+    #msg { font-size: 12px; color: #bbb; margin: 10px 0; min-height: 16px; }
+    ul { list-style: none; padding: 0; margin: 10px 0 0; }
+    li { border-top: 1px solid #333; padding: 8px 0; font-size: 12px; }
+    .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .meta { color: #999; font-size: 11px; margin-top: 3px; }
+    .bar { height: 3px; background: #333; margin-top: 5px; border-radius: 2px; }
+    .bar > i { display: block; height: 100%; background: #4caf6d; border-radius: 2px; }
+    .bar.thin { height: 2px; margin: 2px 0 5px; }
+    .bar.thin > i { background: #4ea8ff; }
+    .substage { margin-top: 6px; padding: 5px 7px; background: #252525; border-radius: 4px; }
+    .subrow { display: flex; justify-content: space-between; font-size: 11px; color: #9bb7d4; margin-top: 2px; }
+    .subrow .lab.done { color: #7ee2a8; }
+    .subrow .lab.pending { color: #777; }
+    .subrow .num { color: #ccc; font-variant-numeric: tabular-nums; }
+    .done { color: #7ee2a8; } .failed { color: #f08a8a; }
+    .acts { display: flex; gap: 6px; margin-top: 7px; }
+    a { color: #4ea8ff; font-size: 11px; }
+    /* 分析结果确认卡片 */
+    #confirm { display: none; margin: 10px 0; border: 1px solid #3a5a7a; background: #222c38; border-radius: 5px; padding: 10px; }
+    #confirm.show { display: block; }
+    #confirm .ch { font-size: 12px; color: #8ec5ff; margin-bottom: 7px; font-weight: 600; }
+    #confirm .ctitle { font-size: 12px; color: #eee; margin-bottom: 8px; line-height: 1.4; }
+    #confirm .crow { display: flex; justify-content: space-between; font-size: 11px; padding: 2px 0; color: #a9b8c8; }
+    #confirm .crow .k { color: #7f93a8; }
+    #confirm .crow .v { color: #dbe7f2; font-variant-numeric: tabular-nums; text-align: right; }
+    #confirm .crow .v.big { color: #ffd479; }
+    #confirm .note { font-size: 10px; color: #6f8296; margin: 7px 0 9px; line-height: 1.4; }
+    #confirm .btns { display: flex; gap: 8px; }
+    #confirm .btns button { flex: 1; }
+    #confirm .btns #confirm-no { background: #555; }
+    #confirm .hintline { font-size: 10px; color: #7f93a8; margin: 0 0 5px; }
+    #confirm .qualities { max-height: 132px; overflow: auto; margin-bottom: 8px; }
+    #confirm .qrow { display: flex; align-items: center; gap: 6px; padding: 3px 5px; border: 1px solid transparent; border-radius: 3px; font-size: 11px; cursor: pointer; }
+    #confirm .qrow:hover { background: #2a3644; }
+    #confirm .qrow.on { border-color: #3a5a7a; background: #27384a; }
+    #confirm .qrow input { margin: 0; accent-color: #4ea8ff; }
+    #confirm .qrow .qn { width: 76px; color: #dbe7f2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #confirm .qrow .qmeta { flex: 1; color: #7f93a8; font-variant-numeric: tabular-nums; }
+    #confirm .qrow .qsize { color: #ffd479; font-variant-numeric: tabular-nums; }
+    #confirm .flabel { display: block; font-size: 10px; color: #7f93a8; margin: 8px 0 3px; }
+    #confirm #c-filename { width: 100%; box-sizing: border-box; padding: 5px 7px; font-size: 11px; background: #1a1a1a; border: 1px solid #3a3a3a; color: #eaeaea; border-radius: 3px; }
+    /* 日志面板 */
+    #logbox { margin-top: 10px; border-top: 1px solid #333; }
+    #loghead { display: flex; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer; font-size: 11px; color: #999; }
+    #loghead b { font-weight: 500; color: #ccc; }
+    #loghead .spacer { flex: 1; }
+    #loghead button { padding: 2px 7px; font-size: 10px; background: #444; }
+    #log { display: none; max-height: 160px; overflow: auto; background: #141414; border: 1px solid #2a2a2a; border-radius: 3px; padding: 5px 6px; font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #log.open { display: block; }
+    #log .l { white-space: pre-wrap; word-break: break-all; color: #b9b9b9; }
+    #log .l .t { color: #666; }
+    #log .l.info .m { color: #cfe3ff; }
+    #log .l.ok .m { color: #7ee2a8; }
+    #log .l.warn .m { color: #e8c47a; }
+    #log .l.err .m { color: #f08a8a; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <h1>bili-dl 下载队列</h1>
+    <span id="conn" class="off" style="margin-left:auto">离线</span>
+  </div>
+
+  <details id="cfgbox">
+    <summary>⚙ 设置（地址 / 令牌 / 限速，改完即生效）</summary>
+    <div class="cfgbody">
+      <label>服务地址（WebSocket）
+        <input id="endpoint" placeholder="ws://192.168.1.10:18080" spellcheck="false">
+      </label>
+      <label>访问令牌
+        <input id="token" type="password" placeholder="与 BILIDL_TOKEN 一致">
+      </label>
+      <label>下载限速（KB/s，0 = 不限速）
+        <input id="speedlimit" type="number" min="0" step="256" placeholder="0">
+      </label>
+      <div class="hint">地址/令牌改动立即重连；限速立即推送到 daemon，正在下载的任务也会生效。</div>
+      <div id="cfgstatus"></div>
+    </div>
+  </details>
+
+  <div class="row">
+    <button id="extract">分析当前视频</button>
+    <button id="retry" class="ghost" title="立即重连，不等待自动退避" hidden>重试连接</button>
+  </div>
+  <div id="msg"></div>
+  <div id="confirm">
+    <div class="ch">📋 分析结果 · 确认下载</div>
+    <div class="ctitle" id="c-title"></div>
+    <div class="hintline">选择清晰度（尺寸随清晰度变化）</div>
+    <div id="c-qualities" class="qualities"></div>
+    <div id="c-rows"></div>
+    <label class="flabel" for="c-filename">保存文件名（相对输出目录，可含子目录，如 视频/第一季/03.mp4）</label>
+    <input id="c-filename" type="text" spellcheck="false" placeholder="标题-bvid-qn.mp4">
+    <div class="note" id="c-note"></div>
+    <div class="btns">
+      <button id="confirm-yes">确认下载</button>
+      <button id="confirm-no">取消</button>
+    </div>
+  </div>
+  <ul id="tasks"></ul>
+  <div id="logbox">
+    <div id="loghead">
+      <b>▸ 调试日志</b><span id="logcount">0</span>
+      <span class="spacer"></span>
+      <button id="logcopy" class="ghost">复制</button>
+      <button id="logclear" class="ghost">清空</button>
+    </div>
+    <div id="log"></div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+extension/
+.workbuddy/
+*.md
+daemon/data/

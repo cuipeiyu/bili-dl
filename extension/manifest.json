@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "bili-dl 下载助手",
+  "version": "0.1.0",
+  "description": "解析页面视频/音频直链，提交到本地 Go 服务下载并用 ffmpeg 合并",
+  "permissions": ["storage", "scripting", "webRequest", "tabs", "alarms"],
+  "host_permissions": [
+    "*://*.bilibili.com/*",
+    "*://*.bilivideo.com/*",
+    "*://*.hdslb.com/*",
+    "http://127.0.0.1/*",
+    "ws://127.0.0.1/*",
+    "http://localhost/*",
+    "ws://localhost/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "optional_host_permissions": ["ws://*/*", "http://*/*", "wss://*/*", "https://*/*"],
+  "background": { "service_worker": "sw.js" },
+  "content_scripts": [
+    {
+      "matches": ["*://*.bilibili.com/*"],
+      "js": ["seed.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "bili-dl"
+  },
+  "options_page": "options.html",
+  "web_accessible_resources": [
+    {
+      "matches": ["*://*.bilibili.com/*"],
+      "resources": ["extractor.js"]
+    }
+  ]
+}
