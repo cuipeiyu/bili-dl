@@ -69,6 +69,8 @@ const headerFilter = {
   urls: [
     '*://*.bilibili.com/x/player/*playurl*',
     '*://*.bilibili.com/x/player/wbi/playurl*',
+    '*://*.bilibili.com/pgc/player/web/playurl*',
+    '*://*.bilibili.com/pgc/player/web/v2/playurl*',
     '*://*.bilivideo.com/*',
     '*://*.hdslb.com/*',
   ],
